@@ -10,6 +10,7 @@
 #include "freertos/task.h"
 #include "esp_log.h"
 #include "esp_timer.h"
+#include "esp_heap_caps.h"
 #include "lcd_st7796.h"
 extern int64_t lcd_get_last_cpu_us(void);
 #include "icon_128x128.h"
@@ -23,7 +24,7 @@ static const char S_PHONE[]   = {(char)0xB5,(char)0xE7,(char)0xBB,(char)0xB0,(ch
 static const char S_SUPPORT[] = {(char)0xD6,(char)0xA7,(char)0xB3,(char)0xD6,(char)0xBA,(char)0xE1,(char)0xC6,(char)0xC1,0};
 
 // ---- 统计缓冲 ----
-static uint16_t stats_buf[320 * 16];
+static uint16_t *stats_buf = NULL;
 static bool     stats_dirty = false;
 
 static void build_stats(float fps, float cpu) {
@@ -36,7 +37,7 @@ static void build_stats(float fps, float cpu) {
 
 // ---- 全功能演示 (屏幕缓冲 → 一次 DMA) ----
 static void full_demo(void) {
-    uint16_t *fb = malloc(320 * 320 * 2);
+    uint16_t *fb = heap_caps_malloc(320 * 320 * 2, MALLOC_CAP_DMA);
     if (!fb) { ESP_LOGE(TAG, "OOM"); return; }
 
     // 1. 蓝底
@@ -122,6 +123,10 @@ void app_main(void) {
     ESP_LOGI(TAG, " TK015F4000  ESP32-S3  ESP-IDF GDMA");
     ESP_LOGI(TAG, " SPI2_HOST @40MHz Mode3  GDMA_AUTO");
     ESP_LOGI(TAG, "========================================");
+
+    // Allocate DMA-safe buffers
+    stats_buf = heap_caps_malloc(320 * 16 * 2, MALLOC_CAP_DMA);
+    if (!stats_buf) { ESP_LOGE(TAG, "stats OOM"); return; }
 
     lcd_init();
     ESP_LOGI(TAG, "LCD init OK. Running demo...");

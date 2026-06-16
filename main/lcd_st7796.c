@@ -10,6 +10,8 @@
 #include "driver/ledc.h"
 #include "esp_log.h"
 #include "esp_timer.h"
+#include "esp_heap_caps.h"
+#include "rom/cache.h"
 #include "freertos/FreeRTOS.h"
 #include "freertos/task.h"
 
@@ -18,6 +20,7 @@ static spi_device_handle_t spi = NULL;
 
 // ---- DMA 传输 ----
 void lcd_write_pixels_dma(const uint8_t *data, size_t len) {
+    Cache_WriteBack_Addr((uint32_t)data, len);
     gpio_set_level(PIN_DC, 1); gpio_set_level(PIN_CS, 0);
     // ESP32-S3 SPI DMA max: 262144 bits = 32768 bytes per transaction
     const size_t MAX_CHUNK = 32768;
@@ -45,13 +48,18 @@ static void write_cmd(uint8_t cmd) {
 static void write_data8(uint8_t dat) {
     gpio_set_level(PIN_DC, 1); gpio_set_level(PIN_CS, 0);
     spi_transaction_t t = { .tx_buffer = &dat, .length = 8 };
-    spi_device_polling_transmit(spi, &t);
+    esp_err_t ret = spi_device_polling_transmit(spi, &t);
+    if (ret != ESP_OK) ESP_LOGE(TAG, "write_data8 err 0x%x", ret);
     gpio_set_level(PIN_CS, 1);
 }
 static void write_data16(uint16_t dat) {
-    // LCD expects MSB-first; ESP32 little-endian → manually send high then low
-    write_data8(dat >> 8);
-    write_data8(dat & 0xFF);
+    // Single CS cycle: send both bytes without toggling CS
+    uint8_t buf[2] = {dat >> 8, dat & 0xFF};
+    gpio_set_level(PIN_DC, 1); gpio_set_level(PIN_CS, 0);
+    spi_transaction_t t = { .tx_buffer = buf, .length = 16 };
+    esp_err_t ret = spi_device_polling_transmit(spi, &t);
+    if (ret != ESP_OK) ESP_LOGE(TAG, "write_data16 err 0x%x", ret);
+    gpio_set_level(PIN_CS, 1);
 }
 void lcd_set_window(uint16_t x1, uint16_t y1, uint16_t x2, uint16_t y2) {
     write_cmd(0x2A); write_data16(x1); write_data16(x2);
@@ -65,7 +73,7 @@ void lcd_init(void) {
     gpio_set_direction(PIN_CS,  GPIO_MODE_OUTPUT); gpio_set_level(PIN_CS, 1);
     gpio_set_direction(PIN_DC,  GPIO_MODE_OUTPUT); gpio_set_level(PIN_DC, 1);
     gpio_set_direction(PIN_RST, GPIO_MODE_OUTPUT); gpio_set_level(PIN_RST, 1);
-    gpio_set_direction(PIN_BL,  GPIO_MODE_OUTPUT); gpio_set_level(PIN_BL, 0);
+    // BL handled by LEDC — do NOT set as GPIO output to avoid conflict
 
     ESP_LOGI(TAG, "HW reset...");
     gpio_set_level(PIN_RST, 1); vTaskDelay(pdMS_TO_TICKS(10));
@@ -146,8 +154,11 @@ void lcd_fill_rect(uint16_t x, uint16_t y, uint16_t w, uint16_t h, uint16_t colo
     if (!w || !h) return;
     lcd_set_window(x, y, x + w - 1, y + h - 1);
     uint32_t n = (uint32_t)w * h;
-    static uint16_t buf[512]; static uint16_t last = 0xFFFF;
+    static uint16_t *buf = NULL; static uint16_t last = 0xFFFF;
+    if (!buf) buf = heap_caps_malloc(512 * 2, MALLOC_CAP_DMA);
+    if (!buf) return;
     if (color != last) { for (int i = 0; i < 512; i++) buf[i] = color; last = color; }
+    Cache_WriteBack_Addr((uint32_t)buf, 512 * 2);
     gpio_set_level(PIN_DC, 1); gpio_set_level(PIN_CS, 0);
     while (n) { uint32_t c = n > 512 ? 512 : n; spi_device_transmit(spi, &(spi_transaction_t){ .tx_buffer = (const uint8_t *)buf, .length = c * 16 }); n -= c; }
     gpio_set_level(PIN_CS, 1);
@@ -235,7 +246,7 @@ void lcd_draw_image_shifted(uint16_t xo, uint16_t xn, uint16_t y, uint16_t w, ui
 
     // Build frame buffer into static DMA-capable memory
     static uint8_t *fb = NULL; static uint32_t fbsz = 0;
-    if (tb > fbsz) { if (fb) free(fb); fb = malloc(tb); fbsz = tb; }
+    if (tb > fbsz) { if (fb) free(fb); fb = heap_caps_malloc(tb, MALLOC_CAP_DMA); fbsz = tb; }
     if (!fb) return;
 
     int64_t cpu_t0 = esp_timer_get_time();
