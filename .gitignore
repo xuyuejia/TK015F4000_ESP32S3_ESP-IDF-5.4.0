@@ -1,0 +1,6 @@
+build/
+sdkconfig.old
+.vscode/
+.clangd
+.claude/
+001.png
