@@ -428,3 +428,71 @@ ESP-IDF 版编译通过，烧录后 LCD 显示不正常。
 ---
 
 *2026-06-16 — GitHub Copilot (DeepSeek V4 Pro)*
+
+---
+
+## 第十一阶段：硬件稳定性修复 (2026-06-16)
+
+### 背景
+
+换了一块同型号开发板后显示正常，确认原板有硬件问题。在正常板子上进行代码审查，发现并修复了 3 个潜在隐患。
+
+### Bug 5: GPIO5 LEDC 背光冲突
+
+**代码**: `lcd_init()` 中 `gpio_set_direction(PIN_BL, GPIO_MODE_OUTPUT)` 将 GPIO5 锁为普通输出。
+
+**现象**: 串口日志出现 `W ledc: GPIO 5 is not usable, maybe conflict with others`，背光无法被 LEDC 控制。
+
+**根因**: `lcd_init()` 先用 `gpio_set_direction` 将 BL 设为 GPIO 输出，之后 `lcd_set_backlight()` 试图配置 LEDC 时发现 GPIO 已被占用。
+
+**修复**: 删除 `lcd_init()` 中 BL 的 GPIO 设置，完全由 `lcd_set_backlight()` 通过 LEDC 管理。
+
+### Bug 6: write_data16 CS 闪烁
+
+**代码**: 
+```c
+static void write_data16(uint16_t dat) {
+    write_data8(dat >> 8);   // CS↓ → 发送高字节 → CS↑
+    write_data8(dat & 0xFF); // CS↓ → 发送低字节 → CS↑
+}
+```
+
+**根因**: 两个字节之间 CS 短暂拉高，ST7796 可能将此视为两次独立的参数写入，导致 CASET/RASET 坐标参数错乱。
+
+**修复**: 合并为单次 16-bit SPI 事务，全程 CS=LOW：
+```c
+uint8_t buf[2] = {dat >> 8, dat & 0xFF};
+spi_device_polling_transmit(spi, &(spi_transaction_t){
+    .tx_buffer = buf, .length = 16
+});
+```
+
+### Bug 7: DMA 缓存一致性问题
+
+**代码**: 所有传给 DMA 的缓冲区使用 `malloc()` 分配，位于 CPU 缓存区内。
+
+**根因**: ESP32-S3 CPU 写入缓存后未刷回物理内存，DMA 直接读物理内存可能读到旧数据。在特定的缓存状态和时序下，DMA 可能读到全零 → 黑屏。
+
+**修复**:
+1. 所有 DMA 缓冲区改用 `heap_caps_malloc(size, MALLOC_CAP_DMA)` 分配（绕过缓存）
+2. 每次 DMA 传输前显式调用 `Cache_WriteBack_Addr()` 确保缓存已刷新
+
+**影响范围**: `full_demo()` fb、`drawImageShifted()` fb、`fill_rect()` buf、`stats_buf`
+
+### 修复总结
+
+| # | 问题 | 严重度 | 修复方式 |
+|---|------|:---:|------|
+| 5 | GPIO5 LEDC 冲突 | 中 | 移除 GPIO 设置，由 LEDC 独占 |
+| 6 | write_data16 CS 闪烁 | 中 | 单次 16-bit SPI 事务 |
+| 7 | DMA 缓存一致性 | 高 | heap_caps_malloc + Cache_WriteBack |
+
+### 关键教训
+
+1. **GPIO 与 LEDC 冲突**: 外设管脚不要先设为 GPIO 再切换，应由目标外设直接初始化。
+2. **SPI 参数写入**: LCD 寄存器参数应在单次 CS 周期内完成，CS 闪烁会破坏参数连续性。
+3. **ESP32-S3 DMA 缓存**: 所有 DMA 缓冲区必须使用 `MALLOC_CAP_DMA` 分配并显式刷缓存，这是 ESP-IDF 开发中最容易踩的坑。
+
+---
+
+*2026-06-16 — GitHub Copilot (DeepSeek V4 Pro)*
