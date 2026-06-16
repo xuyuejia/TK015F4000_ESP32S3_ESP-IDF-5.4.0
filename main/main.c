@@ -132,6 +132,8 @@ void app_main(void) {
     ESP_LOGI(TAG, "LCD init OK. Running demo...");
 
     full_demo();
+    // Backlight ON only AFTER first frame is drawn (avoids startup garbage flash)
+    lcd_set_backlight(255);
     build_stats(0, 0);
     lcd_set_window(0, 304, 319, 319);
     lcd_write_pixels_dma((const uint8_t *)stats_buf, 320 * 16 * 2);

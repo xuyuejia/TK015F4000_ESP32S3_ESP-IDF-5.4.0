@@ -1,6 +1,20 @@
 /**
  * @file    lcd_st7796.c
- * @brief   ST7796S LCD 驱动实现 — ESP-IDF GDMA
+ * @brief   ST7796S LCD 驱动实现 — ESP-IDF v5.4 GDMA 版
+ *
+ *  关键设计决策:
+ *  1. 双 SPI 传输模式:
+ *     - spi_device_polling_transmit: 命令/参数 (1~2 字节, 无 DMA)
+ *     - spi_device_transmit:         像素数据 (GDMA, ≤32KB/块)
+ *  2. DMA 缓存一致性 (ESP32-S3 最易踩的坑):
+ *     - 所有 DMA 缓冲区用 heap_caps_malloc(..., MALLOC_CAP_DMA) 分配
+ *     - 每次 DMA 前显式 Cache_WriteBack_Addr() 刷缓存
+ *  3. write_data16 单次 CS 事务:
+ *     - 两个字节在一个 CS 周期内完成, 避免 CS 闪烁导致参数错乱
+ *  4. 冷启动安全:
+ *     - 400ms 延迟等 LCD 电源稳定 (ESP-IDF 启动比 Arduino 快)
+ *     - 软件复位 (0x01) 确保所有寄存器从默认值开始
+ *     - 背光在首帧绘制完毕后才点亮 (避免启动花屏)
  */
 #include "lcd_st7796.h"
 #include "ascii_font.h"
@@ -69,11 +83,17 @@ void lcd_set_window(uint16_t x1, uint16_t y1, uint16_t x2, uint16_t y2) {
 
 // ---- 初始化 ----
 void lcd_init(void) {
+    // Cold boot: wait for LCD internal power (charge pumps) to stabilize
+    // ESP-IDF boots faster than Arduino — LCD needs ~300ms before ready
+    ESP_LOGI(TAG, "Waiting for LCD power stabilization...");
+    vTaskDelay(pdMS_TO_TICKS(400));
+
     ESP_LOGI(TAG, "Init GPIO...");
     gpio_set_direction(PIN_CS,  GPIO_MODE_OUTPUT); gpio_set_level(PIN_CS, 1);
     gpio_set_direction(PIN_DC,  GPIO_MODE_OUTPUT); gpio_set_level(PIN_DC, 1);
     gpio_set_direction(PIN_RST, GPIO_MODE_OUTPUT); gpio_set_level(PIN_RST, 1);
-    // BL handled by LEDC — do NOT set as GPIO output to avoid conflict
+    // LEDC takes over BL from the start — keep it OFF until first frame
+    lcd_set_backlight(0);
 
     ESP_LOGI(TAG, "HW reset...");
     gpio_set_level(PIN_RST, 1); vTaskDelay(pdMS_TO_TICKS(10));
@@ -93,6 +113,8 @@ void lcd_init(void) {
     ESP_ERROR_CHECK(spi_bus_add_device(SPI2_HOST, &dcfg, &spi));
 
     ESP_LOGI(TAG, "ST7796 init sequence...");
+    // Software reset — ensures all registers at defaults (cold boot safety)
+    write_cmd(0x01); vTaskDelay(pdMS_TO_TICKS(150));
     // Sleep out (datasheet: ≥120ms)
     write_cmd(0x11); vTaskDelay(pdMS_TO_TICKS(150));
     // MADCTL
@@ -133,7 +155,7 @@ void lcd_init(void) {
     write_cmd(0x3A); write_data8(0x55);
     write_cmd(0x36); write_data8(0x48);
 
-    lcd_set_backlight(255);
+    // Backlight is turned on by caller AFTER first frame is drawn
     ESP_LOGI(TAG, "Init done.");
 }
 
