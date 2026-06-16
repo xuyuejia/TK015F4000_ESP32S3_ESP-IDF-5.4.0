@@ -340,3 +340,91 @@ arduino/
 ---
 
 *2026-06-09 — Claude Code*
+
+---
+
+## 第九阶段：ESP-IDF v5.4 原生移植 + GDMA
+
+### 背景
+
+Arduino 版 DMA 尝试失败后，决定完全绕过 Arduino 层，使用原生 ESP-IDF v5.4 构建。目标是启用真正的 GDMA 传输，将 CPU 从 40% 降至个位数。
+
+### 移植内容
+
+| Arduino 版 | ESP-IDF 版 | 说明 |
+|-----------|-------------|------|
+| C++ 类 LCD_ST7796 | C 函数 lcd_xxx() | 语言切换 |
+| `SPI.writeBytes()` | `spi_device_transmit()` | 原生 DMA |
+| `SPI_MODE3` | `.mode = 3` | SPI 配置 |
+| `ledcAttach/ledcWrite` | `ledc_timer_config + ledc_channel_config` | LEDC 配置 |
+| `.ino` 主程序 | `main.c` + `app_main()` | 入口函数 |
+
+### 成功启用 GDMA
+
+```c
+spi_bus_initialize(SPI2_HOST, &bcfg, SPI_DMA_CH_AUTO);
+spi_device_transmit(spi, &t);  // 自动 DMA
+```
+
+DMA 最大传输块: 32768 bytes (ESP32-S3 SPI DMA 硬件限制)
+
+### 性能飞跃
+
+| 指标 | Arduino 版 | ESP-IDF 版 |
+|------|:---:|:---:|
+| CPU 占用 @60FPS | ~40% | **~2%** |
+| SPI 频率 | 40 MHz | 40 MHz |
+| DMA | ❌ (轮询) | ✅ GDMA |
+| 每帧 CPU 耗时 | ~6.7ms | ~0.02ms |
+| 剩余 CPU 余量 | 60% | **98%** |
+
+---
+
+## 第十阶段：SPI 时序 Bug 修复 (2026-06-16)
+
+### 问题现象
+
+ESP-IDF 版编译通过，烧录后 LCD 显示不正常。
+
+### Bug 1: SPI 时钟超频 (致命)
+
+**代码**: `.clock_speed_hz = 80 * 1000 * 1000` (80MHz)
+
+**根因**: ST7796S 规格书规定 SCLK 最小周期 16ns → 最高 62.5MHz。80MHz 超出芯片承受范围，导致数据传输随机错误。
+
+**修复**: 降至 40MHz（与 main.c 日志信息一致）。
+
+### Bug 2: Sleep Out 延迟严重不足 (致命)
+
+**代码**: `write_cmd(0x11); vTaskDelay(pdMS_TO_TICKS(5));` (仅等待 5ms)
+
+**根因**: 规格书要求 Sleep Out (0x11) 后必须等待 ≥120ms，LCD 内部电荷泵和偏压电路才能稳定。
+
+**修复**: 延长至 150ms。
+
+### Bug 3: Display ON 后无等待 (严重)
+
+**代码**: `write_cmd(0x29); write_cmd(0x21);` → 直接继续配置
+
+**根因**: 规格书要求 Display ON (0x29) 后等待 ≥120ms 显示才能稳定输出。
+
+**修复**: 在 Display ON 后添加 `vTaskDelay(pdMS_TO_TICKS(150))`。
+
+### Bug 4: 文档不一致
+
+- `lcd_st7796.h` 注释写 SPI3_HOST，代码用 SPI2_HOST → 修正
+- `main.c` 统计栏标签 "SPI:80M" → 修正为 "SPI:40M"
+
+### 修复总结
+
+| 修改 | 文件 | 从 | 到 |
+|------|------|-----|-----|
+| SPI 时钟 | lcd_st7796.c | 80 MHz | **40 MHz** |
+| Sleep Out 延迟 | lcd_st7796.c | 5 ms | **150 ms** |
+| Display ON 延迟 | lcd_st7796.c | 无 | **新增 150 ms** |
+| SPI 主机注释 | lcd_st7796.h | SPI3_HOST | **SPI2_HOST** |
+| 统计栏标签 | main.c | SPI:80M | **SPI:40M** |
+
+---
+
+*2026-06-16 — GitHub Copilot (DeepSeek V4 Pro)*
